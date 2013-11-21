@@ -1649,6 +1649,8 @@ spa_init(int mode)
 void
 spa_fini(void)
 {
+        ddt_fini();
+
 	l2arc_stop();
 
 	spa_evict_all();
