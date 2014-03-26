@@ -793,10 +793,7 @@ zfs_path_to_zhandle(libzfs_handle_t *hdl, char *path, zfs_type_t argtype)
 		return (NULL);
 	}
 
-	/* Reopen MNTTAB to prevent reading stale data from open file */
-	if (freopen(MNTTAB, "r", hdl->libzfs_mnttab) == NULL)
-		return (NULL);
-
+	rewind(hdl->libzfs_mnttab);
 	while ((ret = getextmntent(hdl->libzfs_mnttab, &entry, 0)) == 0) {
 		if (makedevice(entry.mnt_major, entry.mnt_minor) ==
 		    statbuf.st_dev) {
