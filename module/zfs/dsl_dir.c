@@ -38,6 +38,7 @@
 #include <sys/zio.h>
 #include <sys/arc.h>
 #include <sys/sunddi.h>
+#include <sys/zvol.h>
 #include "zfs_namecheck.h"
 
 static uint64_t dsl_dir_space_towrite(dsl_dir_t *dd);
@@ -47,8 +48,8 @@ static void
 dsl_dir_evict(dmu_buf_t *db, void *arg)
 {
 	dsl_dir_t *dd = arg;
-	ASSERTV(dsl_pool_t *dp = dd->dd_pool;)
 	int t;
+	ASSERTV(dsl_pool_t *dp = dd->dd_pool);
 
 	for (t = 0; t < TXG_SIZE; t++) {
 		ASSERT(!txg_list_member(&dp->dp_dirty_dirs, dd, t));
@@ -589,7 +590,6 @@ dsl_dir_space_available(dsl_dir_t *dd,
 
 struct tempreserve {
 	list_node_t tr_node;
-	dsl_pool_t *tr_dp;
 	dsl_dir_t *tr_ds;
 	uint64_t tr_size;
 };
@@ -635,6 +635,7 @@ dsl_dir_tempreserve_impl(dsl_dir_t *dd, uint64_t asize, boolean_t netfree,
 		    asize, est_inflight, &used_on_disk, &ref_rsrv);
 		if (error) {
 			mutex_exit(&dd->dd_lock);
+			DMU_TX_STAT_BUMP(dmu_tx_quota);
 			return (error);
 		}
 	}
@@ -683,6 +684,7 @@ dsl_dir_tempreserve_impl(dsl_dir_t *dd, uint64_t asize, boolean_t netfree,
 		    used_on_disk>>10, est_inflight>>10,
 		    quota>>10, asize>>10, retval);
 		mutex_exit(&dd->dd_lock);
+		DMU_TX_STAT_BUMP(dmu_tx_quota);
 		return (SET_ERROR(retval));
 	}
 
@@ -740,25 +742,24 @@ dsl_dir_tempreserve_space(dsl_dir_t *dd, uint64_t lsize, uint64_t asize,
 		tr = kmem_zalloc(sizeof (struct tempreserve), KM_PUSHPAGE);
 		tr->tr_size = lsize;
 		list_insert_tail(tr_list, tr);
-
-		err = dsl_pool_tempreserve_space(dd->dd_pool, asize, tx);
 	} else {
 		if (err == EAGAIN) {
+			/*
+			 * If arc_memory_throttle() detected that pageout
+			 * is running and we are low on memory, we delay new
+			 * non-pageout transactions to give pageout an
+			 * advantage.
+			 *
+			 * It is unfortunate to be delaying while the caller's
+			 * locks are held.
+			 */
 			txg_delay(dd->dd_pool, tx->tx_txg,
 			    MSEC2NSEC(10), MSEC2NSEC(10));
 			err = SET_ERROR(ERESTART);
 		}
-		dsl_pool_memory_pressure(dd->dd_pool);
 	}
 
 	if (err == 0) {
-		struct tempreserve *tr;
-
-		tr = kmem_zalloc(sizeof (struct tempreserve), KM_PUSHPAGE);
-		tr->tr_dp = dd->dd_pool;
-		tr->tr_size = asize;
-		list_insert_tail(tr_list, tr);
-
 		err = dsl_dir_tempreserve_impl(dd, asize, fsize >= asize,
 		    FALSE, asize > usize, tr_list, tx, TRUE);
 	}
@@ -787,10 +788,8 @@ dsl_dir_tempreserve_clear(void *tr_cookie, dmu_tx_t *tx)
 	if (tr_cookie == NULL)
 		return;
 
-	while ((tr = list_head(tr_list))) {
-		if (tr->tr_dp) {
-			dsl_pool_tempreserve_clear(tr->tr_dp, tr->tr_size, tx);
-		} else if (tr->tr_ds) {
+	while ((tr = list_head(tr_list)) != NULL) {
+		if (tr->tr_ds) {
 			mutex_enter(&tr->tr_ds->dd_lock);
 			ASSERT3U(tr->tr_ds->dd_tempreserved[txgidx], >=,
 			    tr->tr_size);
@@ -806,38 +805,38 @@ dsl_dir_tempreserve_clear(void *tr_cookie, dmu_tx_t *tx)
 	kmem_free(tr_list, sizeof (list_t));
 }
 
-static void
-dsl_dir_willuse_space_impl(dsl_dir_t *dd, int64_t space, dmu_tx_t *tx)
-{
-	int64_t parent_space;
-	uint64_t est_used;
-
-	mutex_enter(&dd->dd_lock);
-	if (space > 0)
-		dd->dd_space_towrite[tx->tx_txg & TXG_MASK] += space;
-
-	est_used = dsl_dir_space_towrite(dd) + dd->dd_phys->dd_used_bytes;
-	parent_space = parent_delta(dd, est_used, space);
-	mutex_exit(&dd->dd_lock);
-
-	/* Make sure that we clean up dd_space_to* */
-	dsl_dir_dirty(dd, tx);
-
-	/* XXX this is potentially expensive and unnecessary... */
-	if (parent_space && dd->dd_parent)
-		dsl_dir_willuse_space_impl(dd->dd_parent, parent_space, tx);
-}
-
 /*
- * Call in open context when we think we're going to write/free space,
- * eg. when dirtying data.  Be conservative (ie. OK to write less than
- * this or free more than this, but don't write more or free less).
+ * This should be called from open context when we think we're going to write
+ * or free space, for example when dirtying data. Be conservative; it's okay
+ * to write less space or free more, but we don't want to write more or free
+ * less than the amount specified.
+ *
+ * NOTE: The behavior of this function is identical to the Illumos / FreeBSD
+ * version however it has been adjusted to use an iterative rather then
+ * recursive algorithm to minimize stack usage.
  */
 void
 dsl_dir_willuse_space(dsl_dir_t *dd, int64_t space, dmu_tx_t *tx)
 {
-	dsl_pool_willuse_space(dd->dd_pool, space, tx);
-	dsl_dir_willuse_space_impl(dd, space, tx);
+	int64_t parent_space;
+	uint64_t est_used;
+
+	do {
+		mutex_enter(&dd->dd_lock);
+		if (space > 0)
+			dd->dd_space_towrite[tx->tx_txg & TXG_MASK] += space;
+
+		est_used = dsl_dir_space_towrite(dd) +
+		    dd->dd_phys->dd_used_bytes;
+		parent_space = parent_delta(dd, est_used, space);
+		mutex_exit(&dd->dd_lock);
+
+		/* Make sure that we clean up dd_space_to* */
+		dsl_dir_dirty(dd, tx);
+
+		dd = dd->dd_parent;
+		space = parent_space;
+	} while (space && dd);
 }
 
 /* call from syncing context when we actually write/free space for this dd */
@@ -1106,7 +1105,7 @@ dsl_dir_set_reservation_sync(void *arg, dmu_tx_t *tx)
 		    zfs_prop_to_name(ZFS_PROP_RESERVATION),
 		    ddsqra->ddsqra_source, sizeof (ddsqra->ddsqra_value), 1,
 		    &ddsqra->ddsqra_value, tx);
- 
+
 		VERIFY0(dsl_prop_get_int_ds(ds,
 		    zfs_prop_to_name(ZFS_PROP_RESERVATION), &newval));
 	} else {
@@ -1118,7 +1117,7 @@ dsl_dir_set_reservation_sync(void *arg, dmu_tx_t *tx)
 
 	dsl_dir_set_reservation_sync_impl(ds->ds_dir, newval, tx);
 	dsl_dataset_rele(ds, FTAG);
- }
+}
 
 int
 dsl_dir_set_reservation(const char *ddname, zprop_source_t source,
@@ -1311,6 +1310,10 @@ dsl_dir_rename_sync(void *arg, dmu_tx_t *tx)
 	/* add to new parent zapobj */
 	VERIFY0(zap_add(mos, newparent->dd_phys->dd_child_dir_zapobj,
 	    dd->dd_myname, 8, 1, &dd->dd_object, tx));
+
+#ifdef _KERNEL
+	zvol_rename_minors(ddra->ddra_oldname, ddra->ddra_newname);
+#endif
 
 	dsl_prop_notify_all(dd);
 

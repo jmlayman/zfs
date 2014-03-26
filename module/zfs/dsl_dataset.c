@@ -22,6 +22,7 @@
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2013 by Delphix. All rights reserved.
  * Copyright (c) 2012, Joyent, Inc. All rights reserved.
+ * Copyright (c) 2014 RackTop Systems.
  */
 
 #include <sys/dmu_objset.h>
@@ -1229,6 +1230,16 @@ dsl_dataset_snapshot(nvlist_t *snaps, nvlist_t *props, nvlist_t *errors)
 		fnvlist_free(suspended);
 	}
 
+#ifdef _KERNEL
+	if (error == 0) {
+		for (pair = nvlist_next_nvpair(snaps, NULL); pair != NULL;
+		    pair = nvlist_next_nvpair(snaps, pair)) {
+			char *snapname = nvpair_name(pair);
+			zvol_create_minors(snapname);
+		}
+	}
+#endif
+
 	return (error);
 }
 
@@ -1361,7 +1372,7 @@ get_clones_stat(dsl_dataset_t *ds, nvlist_t *nv)
 	 * Only trust it if it has the right number of entries.
 	 */
 	if (ds->ds_phys->ds_next_clones_obj != 0) {
-		ASSERT0(zap_count(mos, ds->ds_phys->ds_next_clones_obj,
+		VERIFY0(zap_count(mos, ds->ds_phys->ds_next_clones_obj,
 		    &count));
 	}
 	if (count != ds->ds_phys->ds_num_children - 1)
@@ -1601,6 +1612,9 @@ static int
 dsl_dataset_rename_snapshot_sync_impl(dsl_pool_t *dp,
     dsl_dataset_t *hds, void *arg)
 {
+#ifdef _KERNEL
+	char *oldname, *newname;
+#endif
 	dsl_dataset_rename_snapshot_arg_t *ddrsa = arg;
 	dsl_dataset_t *ds;
 	uint64_t val;
@@ -1626,6 +1640,18 @@ dsl_dataset_rename_snapshot_sync_impl(dsl_pool_t *dp,
 	mutex_exit(&ds->ds_lock);
 	VERIFY0(zap_add(dp->dp_meta_objset, hds->ds_phys->ds_snapnames_zapobj,
 	    ds->ds_snapname, 8, 1, &ds->ds_object, tx));
+
+#ifdef _KERNEL
+	oldname = kmem_alloc(MAXPATHLEN, KM_PUSHPAGE);
+	newname = kmem_alloc(MAXPATHLEN, KM_PUSHPAGE);
+	snprintf(oldname, MAXPATHLEN, "%s@%s", ddrsa->ddrsa_fsname,
+	    ddrsa->ddrsa_oldsnapname);
+	snprintf(newname, MAXPATHLEN, "%s@%s", ddrsa->ddrsa_fsname,
+	    ddrsa->ddrsa_newsnapname);
+	zvol_rename_minors(oldname, newname);
+	kmem_free(newname, MAXPATHLEN);
+	kmem_free(oldname, MAXPATHLEN);
+#endif
 
 	dsl_dataset_rele(ds, FTAG);
 	return (0);

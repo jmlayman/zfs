@@ -307,7 +307,7 @@ See \fBzpool\fR(8) for more information on creating and administering pools.
 A snapshot is a read-only copy of a file system or volume. Snapshots can be created extremely quickly, and initially consume no additional space within the pool. As data within the active dataset changes, the snapshot consumes more data than would otherwise be shared with the active dataset.
 .sp
 .LP
-Snapshots can have arbitrary names. Snapshots of volumes can be cloned or rolled back, but cannot be accessed independently.
+Snapshots can have arbitrary names. Snapshots of volumes can be cloned or rolled back.  Visibility is determined by the \fBsnapdev\fR property of the parent volume.
 .sp
 .LP
 File system snapshots can be accessed under the \fB\&.zfs/snapshot\fR directory in the root of the file system. Snapshots are automatically mounted on demand and may be unmounted at regular intervals. The visibility of the \fB\&.zfs\fR directory can be controlled by the \fBsnapdir\fR property.
@@ -738,7 +738,7 @@ the \fBxattr=sa\fR property.  See the \fBxattr\fR property for more details.
 .ad
 .sp .6
 .RS 4n
-Controls whether the access time for files is updated when they are read. Turning this property off avoids producing write traffic when reading files and can result in significant performance gains, though it might confuse mailers and other similar utilities. The default value is \fBon\fR.
+Controls whether the access time for files is updated when they are read. Turning this property off avoids producing write traffic when reading files and can result in significant performance gains, though it might confuse mailers and other similar utilities. The default value is \fBon\fR.  See also \fBrelatime\fR below.
 .RE
 
 .sp
@@ -1025,6 +1025,17 @@ This property can also be referred to by its shortened column name, \fBrefreserv
 .ne 2
 .mk
 .na
+\fB\fBrelatime\fR=\fBon\fR | \fBoff\fR\fR
+.ad
+.sp .6
+.RS 4n
+Controls the manner in which the access time is updated when \fBatime=on\fR is set.  Turning this property \fBon\fR causes the access time to be updated relative to the modify or change time.  Access time is only updated if the previous access time was earlier than the current modify or change time or if the existing access time hasn't been updated within the past 24 hours.  The default value is \fBoff\fR.
+.RE
+
+.sp
+.ne 2
+.mk
+.na
 \fB\fBreservation\fR=\fIsize\fR | \fBnone\fR\fR
 .ad
 .sp .6
@@ -1298,6 +1309,52 @@ Indicates whether the file system should reject file names that include characte
 .sp
 .LP
 The \fBcasesensitivity\fR, \fBnormalization\fR, and \fButf8only\fR properties are also new permissions that can be assigned to non-privileged users by using the \fBZFS\fR delegated administration feature.
+.RE
+
+.sp
+.ne 2
+.mk
+.na
+\fB\fBcontext\fR=\fBSELinux_User:SElinux_Role:Selinux_Type:Sensitivity_Level\fR\fR
+.ad
+.sp .6
+.RS 4n
+This flag sets the SELinux context for all files in the filesytem under the mountpoint for that filesystem.  See \fBselinux\fR(8) for more information.
+.RE
+
+.sp
+.ne 2
+.mk
+.na
+\fB\fBfscontext\fR=\fBSELinux_User:SElinux_Role:Selinux_Type:Sensitivity_Level\fR\fR
+.ad
+.sp .6
+.RS 4n
+This flag sets the SELinux context for the filesytem being mounted.  See \fBselinux\fR(8) for more information.
+.RE
+
+.sp
+.ne 2
+.mk
+.na
+\fB\fBdefntext\fR=\fBSELinux_User:SElinux_Role:Selinux_Type:Sensitivity_Level\fR\fR
+.ad
+.sp .6
+.RS 4n
+This flag sets the SELinux context for unlabeled files.  See \fBselinux\fR(8) for more information.
+.RE
+
+.sp
+.ne 2
+.mk
+.na
+\fB\fBrootcontext\fR=\fBSELinux_User:SElinux_Role:Selinux_Type:Sensitivity_Level\fR\fR
+.ad
+.sp .6
+.RS 4n
+This flag sets the SELinux context for the root inode of the filesystem.  See \fBselinux\fR(8) for more information.
+.RE
+
 .SS "Temporary Mount Point Properties"
 .LP
 When a file system is mounted, either through \fBmount\fR(8) for legacy mounts or the \fBzfs mount\fR command for normal file systems, its mount options are set according to its properties. The correlation between properties and mount options is as follows:
@@ -3138,6 +3195,7 @@ pool/home/bob  usedbyrefreservation  0                      -
 pool/home/bob  logbias               latency                default
 pool/home/bob  dedup                 off                    default
 pool/home/bob  mlslabel              none                   default
+pool/home/bob  relatime              off                    default
 .fi
 .in -2
 .sp
